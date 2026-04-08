@@ -3,6 +3,7 @@
 - Use NumberFormat framework for decimal and thousands separators
 - Restructure settings, add balance denomination picker, theme-aware UI, wallet cache
 - Fix light mode background to match QR code white
+- Preserve cached payments on screen when WiFi goes offline
 
 0.2.2
 =====
