@@ -2,6 +2,10 @@
 =====
 - Fix payment list never refreshing on budgeted NWC connections (e.g. Primal/Spark, Alby with a spend budget). The NWC main loop only triggered `fetch_payments` when `handle_new_balance` saw the balance change — but on budgeted connections `get_balance` returns the connection's spend budget (locked at the value chosen during NWC setup), so the balance never moves and the transaction list was fetched only once on initial connect and then frozen forever. Now polls `list_transactions` every cycle alongside `fetch_balance`, so newly received payments appear within ≤120 s regardless of whether the displayed balance moves
 
+0.3.1
+=====
+- Fix LNBits wallet silently dying after a single `fetch_static_receive_code` network error. The call sits in the main poll loop but was not guarded by a try/except like `fetch_balance` — any 5xx / timeout / DNS glitch tore the task out of its `while self.keep_running:` and no code restarted it, so the wallet appeared frozen until the user reopened the app. Now wraps the fetch the same way as the balance path, surfaces the error via `handle_error`, and continues on the next cycle
+
 0.3.0
 =====
 - Light/Dark theme toggle in Customise settings — app-local override that doesn't touch the OS-level theme; other apps and the launcher keep the user's OS preference
