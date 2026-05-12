@@ -5,6 +5,14 @@
 - Stale-data indicator: a small dot appears beneath the mascot when the wallet has produced only errors for a sustained period. Two tiers — orange after 10 minutes of failures (data might be slightly behind) and red after 60 minutes (definitely old). Cleared automatically on the next successful refresh
 - Cache file format bumped to v2; any existing v1 cache file is silently discarded on first launch
 
+0.3.2
+=====
+- Fix payment list never refreshing on budgeted NWC connections (e.g. Primal/Spark, Alby with a spend budget). The NWC main loop only triggered `fetch_payments` when `handle_new_balance` saw the balance change — but on budgeted connections `get_balance` returns the connection's spend budget (locked at the value chosen during NWC setup), so the balance never moves and the transaction list was fetched only once on initial connect and then frozen forever. Now polls `list_transactions` every cycle alongside `fetch_balance`, so newly received payments appear within ≤120 s regardless of whether the displayed balance moves
+
+0.3.1
+=====
+- Fix LNBits wallet silently dying after a single `fetch_static_receive_code` network error. The call sits in the main poll loop but was not guarded by a try/except like `fetch_balance` — any 5xx / timeout / DNS glitch tore the task out of its `while self.keep_running:` and no code restarted it, so the wallet appeared frozen until the user reopened the app. Now wraps the fetch the same way as the balance path, surfaces the error via `handle_error`, and continues on the next cycle
+
 0.3.0
 =====
 - Light/Dark theme toggle in Customise settings — app-local override that doesn't touch the OS-level theme; other apps and the launcher keep the user's OS preference
@@ -13,6 +21,11 @@
 - Switching wallets no longer shows stale data for a few seconds — previously the old balance (re-animated for 15 s), old transactions (from cached previous-wallet data), and old QR code (widget not hidden on swap) would linger before the new wallet's fetch completed
 - Switching wallets no longer exhausts the ESP32 TCP socket pool: `NWCWallet.stop()` and `LNBitsWallet.stop()` now eagerly close relay websockets / payment-notification websockets, and the new wallet's startup waits for the old one's sockets to release before opening its own (fixes "Could not connect to any Nostr Wallet Connect relays" on quick swaps)
 - Scrub three more secret-leak paths: the `wallet config changed` log line (leaked URLs/secret/readkey during restarts) and three `RuntimeError` messages in `LNBitsWallet.fetch_*` methods (leaked the readkey to the on-screen error label when a fetch failed)
+- Remove dead send_button code (pre-multi-wallet placeholder that never shipped) and its orphan tap handler
+- Guard the payments_updated_cb callback against a missing assignment (consistency with the peer callbacks)
+- Correct a misleading comment that claimed wallet callbacks run "on another thread" — they actually run on the same event loop as LVGL via TaskManager.create_task
+- Security: scrub NWC URL, secret, and pubkey from debug logs. The Nostr Wallet Connect secret authorises spending; prior builds printed it to serial/REPL during `parse_nwc_url()`, so any shared debug output exposed wallet control. Redacted eight leak points (full URL, post-prefix URL, url-decoded URL, raw query string containing `secret=`, extracted secret, extracted pubkey, parsed-summary line, and RuntimeError message).
+- Adapt to MicroPythonOS 0.9.3 changed fontname font_montserrat_28_compressed to font_montserrat_28
 
 0.2.6
 =====
