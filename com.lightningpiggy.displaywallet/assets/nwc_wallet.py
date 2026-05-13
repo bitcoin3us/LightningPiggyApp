@@ -38,7 +38,18 @@ class NWCWallet(Wallet):
 
     PAYMENTS_TO_SHOW = 6
     PERIODIC_FETCH_BALANCE_SECONDS = 120 # seconds — NWC pushes cover real-time payments, this poll is a heartbeat / silent-disconnect check
-    
+
+    # Watchdog for the half-broken-relay case: the TCP connection sends fine
+    # but receives nothing (one-way packet loss on a weak WiFi signal can
+    # leave the socket in this state, and the kernel-level TCP timeout on
+    # ESP32 takes a very long time to fire). After this many consecutive
+    # poll cycles where we PUBLISH but receive ZERO events back from the
+    # relay, force a relay close + reopen + re-subscription. 3 cycles =
+    # 6 minutes of silence before reconnect, which is still less than the
+    # 10-minute stale-indicator threshold so most users will never see the
+    # orange dot for this failure mode.
+    RELAY_SILENT_RECONNECT_THRESHOLD = 3
+
     relays = []
     secret = None
     wallet_pubkey = None
@@ -49,6 +60,10 @@ class NWCWallet(Wallet):
         # during stop() while the async close_connections task is in flight).
         self._cleanup_done = True
         self.relay_manager = None
+        # Watchdog state: count of poll cycles since the last received
+        # event from any relay. Reset to 0 every time an event arrives
+        # (success), incremented after each fetch_balance/payments pair.
+        self._polls_since_last_event = 0
         self.nwc_url = nwc_url
         if not nwc_url:
             raise ValueError('NWC URL is not set.')
@@ -87,6 +102,67 @@ class NWCWallet(Wallet):
         except Exception as e:
             print("NWCWallet: error closing relay connections: {}".format(e))
         self._cleanup_done = True
+
+    def _setup_subscription(self):
+        """Register the NIP-47 response/notification subscription with all
+        connected relays and publish the REQUEST message. Pulled out of the
+        main task body so we can also call it after a watchdog reconnect."""
+        self.subscription_id = "micropython_nwc_" + str(round(time.time()))
+        print(f"DEBUG: Setting up subscription with ID: {self.subscription_id}")
+        self.filters = Filters([Filter(
+            #event_ids=[self.subscription_id], would be nice to filter, but not like this
+            kinds=[23195, 23196],  # NWC reponses and notifications
+            authors=[self.wallet_pubkey],
+            pubkey_refs=[self.private_key.public_key.hex()]
+        )])
+        print(f"DEBUG: Subscription filters: {self.filters.to_json_array()}")
+        self.relay_manager.add_subscription(self.subscription_id, self.filters)
+        request_message = [ClientMessageType.REQUEST, self.subscription_id]
+        request_message.extend(self.filters.to_json_array())
+        print(f"DEBUG: Publishing subscription request")
+        self.relay_manager.publish_message(json.dumps(request_message))
+        print(f"DEBUG: Published subscription request")
+
+    async def _reconnect_relay(self):
+        """Watchdog action: the TCP send-side is working (we keep publishing
+        successfully) but no events have come back from the relay for
+        RELAY_SILENT_RECONNECT_THRESHOLD consecutive polls. The socket is
+        most likely in a half-broken state — kernel-level TCP timeout on
+        ESP32 takes minutes-to-hours to fire — so force a fresh connection
+        instead of waiting it out.
+
+        Closes the existing relay_manager's connections, builds a fresh
+        manager (the connection objects may be in a bad internal state —
+        a new instance is safer than reusing), reopens, re-subscribes."""
+        print("NWCWallet: watchdog reconnecting relay (silent for {} polls)".format(
+            self._polls_since_last_event))
+        try:
+            await self.relay_manager.close_connections()
+        except Exception as e:
+            print("NWCWallet: close during reconnect failed (continuing): {}".format(e))
+        self.relay_manager = RelayManager()
+        for relay in self.relays:
+            self.relay_manager.add_relay(relay)
+        try:
+            await self.relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE})
+        except Exception as e:
+            print("NWCWallet: open_connections during reconnect failed: {}".format(e))
+            # Don't return — fall through and try to re-subscribe; the next
+            # iteration of the watchdog will catch repeated failure.
+        # Brief wait for at least one relay to come up so add_subscription
+        # has a connected target. 5 s is enough for the WebSocket handshake
+        # on a healthy link; longer would block the main loop.
+        for _ in range(50):
+            await TaskManager.sleep(0.1)
+            if not self.keep_running:
+                return
+            if self.relay_manager.connected_or_errored_relays() == len(self.relays):
+                break
+        self._setup_subscription()
+        # Reset the watchdog counter regardless of whether the reconnect
+        # actually fixed things — if the relay is still silent we'll just
+        # trip the watchdog again N polls later and retry.
+        self._polls_since_last_event = 0
 
     def getCommentFromTransaction(self, transaction):
         comment = ""
@@ -141,23 +217,7 @@ class NWCWallet(Wallet):
 
         print(f"{nrconnected} relays connected")
 
-        # Set up subscription to receive response
-        self.subscription_id = "micropython_nwc_" + str(round(time.time()))
-        print(f"DEBUG: Setting up subscription with ID: {self.subscription_id}")
-        self.filters = Filters([Filter(
-            #event_ids=[self.subscription_id], would be nice to filter, but not like this
-            kinds=[23195, 23196],  # NWC reponses and notifications
-            authors=[self.wallet_pubkey],
-            pubkey_refs=[self.private_key.public_key.hex()]
-        )])
-        print(f"DEBUG: Subscription filters: {self.filters.to_json_array()}")
-        self.relay_manager.add_subscription(self.subscription_id, self.filters)
-        print(f"DEBUG: Creating subscription request")
-        request_message = [ClientMessageType.REQUEST, self.subscription_id]
-        request_message.extend(self.filters.to_json_array())
-        print(f"DEBUG: Publishing subscription request")
-        self.relay_manager.publish_message(json.dumps(request_message))
-        print(f"DEBUG: Published subscription request")
+        self._setup_subscription()
 
         last_fetch_balance = time.time() - self.PERIODIC_FETCH_BALANCE_SECONDS
         while True: # handle incoming events and do periodic fetch_balance
@@ -172,6 +232,25 @@ class NWCWallet(Wallet):
 
             if time.time() - last_fetch_balance >= self.PERIODIC_FETCH_BALANCE_SECONDS:
                 last_fetch_balance = time.time()
+                # Watchdog: if the relay has been silent across
+                # RELAY_SILENT_RECONNECT_THRESHOLD prior poll cycles
+                # (i.e. we published RPCs but no useful responses came
+                # back), the WebSocket is most likely in a half-broken
+                # state. Force a reconnect BEFORE issuing the next pair
+                # of publishes so they go out over a fresh socket. The
+                # counter is reset in the response handler below only
+                # when a USEFUL response (balance or transactions)
+                # arrives — historical events from subscription setup,
+                # decryption failures, and push notifications without
+                # `result` don't count. This is important: an earlier
+                # iteration reset on any `has_events()` and that masked
+                # the half-broken state because non-useful chatter kept
+                # zeroing the counter.
+                if self._polls_since_last_event >= self.RELAY_SILENT_RECONNECT_THRESHOLD:
+                    await self._reconnect_relay()
+                    if not self.keep_running:
+                        break
+                self._polls_since_last_event += 1
                 try:
                     await self.fetch_balance()
                 except Exception as e:
@@ -191,6 +270,17 @@ class NWCWallet(Wallet):
 
             start_time = time.ticks_ms()
             if self.relay_manager.message_pool.has_events():
+                # NB: don't reset the watchdog counter here. has_events()
+                # also returns True for events that aren't useful NWC
+                # responses — historical events from subscription setup,
+                # decryption-failure cases, push notifications without
+                # a `result` field, etc. Resetting too eagerly masks
+                # the half-broken-socket state where the relay sends
+                # back chatter but never the actual poll responses.
+                # The counter resets only in the branches below that
+                # actually deliver fresh balance or transactions data
+                # (i.e., the same branches that refresh last_updated
+                # via notify_poll_success / handle_new_payments).
                 print(f"DEBUG: Event received from message pool after {time.ticks_ms()-start_time}ms")
                 event_msg = self.relay_manager.message_pool.get_event()
                 event_created_at = event_msg.event.created_at
@@ -215,6 +305,14 @@ class NWCWallet(Wallet):
                             # stale-data indicator never resets when balance
                             # is unchanged across polls.
                             self.notify_poll_success()
+                            # Watchdog reset: a USEFUL response arrived
+                            # (balance), so the relay is alive in both
+                            # directions for the path we care about. Any
+                            # accumulated silence streak is forgiven.
+                            if self._polls_since_last_event > 0:
+                                print("NWCWallet: watchdog counter reset (was {}, balance arrived)".format(
+                                    self._polls_since_last_event))
+                            self._polls_since_last_event = 0
                         elif result.get("transactions") is not None:
                             print("Response contains transactions!")
                             new_payment_list = UniqueSortedList()
@@ -229,6 +327,11 @@ class NWCWallet(Wallet):
                                 # do them all in one shot instead of one-by-one because the lv_async() isn't always chronological,
                                 # so when a long list of payments is added, it may be overwritten by a short list
                                 self.handle_new_payments(new_payment_list)
+                            # Watchdog reset: useful response (transactions).
+                            if self._polls_since_last_event > 0:
+                                print("NWCWallet: watchdog counter reset (was {}, transactions arrived)".format(
+                                    self._polls_since_last_event))
+                            self._polls_since_last_event = 0
                     else:
                         notification = response.get("notification")
                         if notification:
