@@ -83,6 +83,29 @@ def _add_floating_back_button(screen, finish_callback):
         focusgroup.add_obj(back_btn)
 
 
+def _migrate_legacy_symbol_denom(prefs):
+    """One-shot migration: legacy ``"symbol"`` pref value → ``"₿ symbol"``.
+
+    The denomination value used to be the cryptic string ``"symbol"`` (label
+    "₿ sats" in the picker). The Customise → Balance Denomination row
+    displayed the raw stored value as its secondary text — "symbol" with
+    no glyph and no clue what mode it referred to. Renaming the value to
+    ``"₿ symbol"`` (matching the visible label) lets the placeholder read
+    cleanly.
+
+    This helper is idempotent: a no-op for users already on the new value,
+    for users who never used the symbol mode, and on every boot after the
+    first migration. Returns True iff something was migrated (for tests).
+    """
+    if prefs.get_string("balance_denomination") == "symbol":
+        editor = prefs.edit()
+        editor.put_string("balance_denomination", "₿ symbol")
+        editor.commit()
+        print("displaywallet: migrated balance_denomination 'symbol' -> '₿ symbol'")
+        return True
+    return False
+
+
 def _should_show_wallet_setting(setting):
     """Conditionally show wallet-specific settings based on selected wallet type."""
     prefs = SharedPreferences("com.lightningpiggy.displaywallet")
@@ -256,7 +279,12 @@ class DenominationSettingsActivity(Activity):
     """Custom denomination picker with 2-column radio button layout."""
     DENOMINATIONS = [
         ("sats", "sats"),
-        ("\u20bf sats", "symbol"),
+        # Both label and stored value are "\u20bf symbol" \u2014 the previous "symbol"
+        # internal value rendered cryptically in the Customise \u2192 Balance
+        # Denomination placeholder (no glyph, no clue what it meant). Old
+        # prefs with the legacy "symbol" value are auto-migrated in
+        # DisplayWallet.onCreate.
+        ("\u20bf symbol", "\u20bf symbol"),
         ("bits", "bits"),
         ("micro-BTC", "ubtc"),
         ("milli-BTC", "mbtc"),
@@ -414,12 +442,32 @@ class DisplayWallet(Activity):
     STALE_WARN_THRESHOLD_S = 600   # 10 minutes → orange
     STALE_ERROR_THRESHOLD_S = 3600 # 60 minutes → red
 
+    # Auto-scroll the payments area back to the top after this many ms of
+    # no screen contact, so the device naturally re-presents the most
+    # recent transactions to anyone who walks up after the previous user
+    # scrolled down to inspect older entries.
+    AUTO_SCROLL_PAYMENTS_INACTIVITY_MS = 120000   # 2 minutes
+
     # activities
     fullscreenqr = FullscreenQR() # need a reference to be able to finish() it
 
     def onCreate(self):
         self.prefs = SharedPreferences("com.lightningpiggy.displaywallet")
+        # Run any required pref migrations before any code path reads
+        # `balance_denomination` (display_balance / DENOMINATION_CYCLE).
+        _migrate_legacy_symbol_denom(self.prefs)
         self.main_screen = lv.obj()
+        # Disable scrolling on the screen itself — overflowing widgets are
+        # supposed to scroll in-place (the payments_container below has its
+        # own vertical scroll). Without this, a growing payments_label
+        # used to drag the whole screen along with it.
+        self.main_screen.set_scroll_dir(lv.DIR.NONE)
+        self.main_screen.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+        # Track the timestamp of the most recent screen contact (any touch
+        # on any interactive widget). Drives the auto-scroll-to-top
+        # behaviour for the payments area after
+        # AUTO_SCROLL_PAYMENTS_INACTIVITY_MS of no user input.
+        self._last_screen_contact_ms = None
         if not AppearanceManager.is_light_mode():
             self.main_screen.set_style_bg_color(lv.color_black(), lv.PART.MAIN)
         else:
@@ -434,6 +482,14 @@ class DisplayWallet(Activity):
         self.balance_label.set_style_text_font(lv.font_montserrat_24, lv.PART.MAIN)
         self.balance_label.add_flag(lv.obj.FLAG.CLICKABLE)
         self.balance_label.set_width(DisplayMetrics.pct_of_width(100-self.receive_qr_pct_of_display)) # 100 - receive_qr
+        # Explicit height (45 px) extends the tap target downward to the
+        # underline at y=35 and the gap above the payments area at y=45.
+        # Without this the label height auto-fits to the text (~29 px),
+        # which is below the iOS 44 / Material 48 minimum and made the
+        # tap-to-cycle-denomination gesture finicky on hardware. The
+        # extra space is empty (text still renders top-aligned), so this
+        # only changes the click region — no visual change.
+        self.balance_label.set_height(45)
         self.balance_label.add_event_cb(self.balance_label_clicked_cb, lv.EVENT.CLICKED, None)
         self.receive_qr = lv.qrcode(self.main_screen)
         self.receive_qr.set_size(DisplayMetrics.pct_of_width(self.receive_qr_pct_of_display)) # bigger QR results in simpler code (less error correction?)
@@ -445,11 +501,35 @@ class DisplayWallet(Activity):
         self.receive_qr.set_style_border_width(8, lv.PART.MAIN);
         self.receive_qr.add_flag(lv.obj.FLAG.CLICKABLE)
         self.receive_qr.add_event_cb(self.qr_clicked_cb,lv.EVENT.CLICKED,None)
-        self.payments_label = lv.label(self.main_screen)
+        # Payments live inside a fixed-height container that scrolls
+        # vertically when the text overflows. Without this wrapper, a
+        # long zap comment or a long list of payments would push the
+        # payments_label past the bottom of the screen and the whole
+        # main_screen would gain a scrollbar — disorienting because
+        # the balance + QR + hero would all scroll along with the
+        # transactions list. With the wrapper, ONLY the transactions
+        # area scrolls and the rest of the screen stays put.
+        payments_container_width = DisplayMetrics.pct_of_width(100-self.receive_qr_pct_of_display)
+        payments_container_height = DisplayMetrics.height() - 50
+        self.payments_container = lv.obj(self.main_screen)
+        self.payments_container.align_to(balance_line, lv.ALIGN.OUT_BOTTOM_LEFT, 2, 10)
+        self.payments_container.set_size(payments_container_width, payments_container_height)
+        self.payments_container.set_style_border_width(0, lv.PART.MAIN)
+        self.payments_container.set_style_pad_all(0, lv.PART.MAIN)
+        self.payments_container.set_style_bg_opa(lv.OPA.TRANSP, lv.PART.MAIN)
+        # Vertical scroll only — horizontal would clash with the wrap.
+        # SCROLLBAR_MODE.OFF hides the bar entirely (container is still
+        # scrollable via touch drag), reclaiming the pixels AUTO mode
+        # would have reserved.
+        self.payments_container.set_scroll_dir(lv.DIR.VER)
+        self.payments_container.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+        self.payments_label = lv.label(self.payments_container)
         self.payments_label.set_text("")
-        self.payments_label.align_to(balance_line,lv.ALIGN.OUT_BOTTOM_LEFT, 2, 10)
+        self.payments_label.set_width(lv.pct(100))
         self.update_payments_label_font()
-        self.payments_label.set_width(DisplayMetrics.pct_of_width(100-self.receive_qr_pct_of_display)) # 100 - receive_qr
+        # Force word-wrap as a belt-and-braces against long zap comments
+        # or unusually long payment memos.
+        self.payments_label.set_long_mode(lv.label.LONG_MODE.WRAP)
         self.payments_label.add_flag(lv.obj.FLAG.CLICKABLE)
         self.payments_label.add_event_cb(self.payments_label_clicked,lv.EVENT.CLICKED,None)
         # Hero image below QR code
@@ -526,7 +606,19 @@ class DisplayWallet(Activity):
             focusgroup.add_obj(settings_button)
 
         # Track wallet-mode widgets so they can be hidden/shown as a group
-        self.wallet_container_widgets = [balance_line, self.balance_label, self.receive_qr, self.payments_label, self.hero_container, settings_button]
+        self.wallet_container_widgets = [balance_line, self.balance_label, self.receive_qr, self.payments_container, self.hero_container, settings_button]
+        # Install the screen-contact tracker on every interactive widget.
+        # LVGL 9 doesn't bubble events to ancestors by default, so a
+        # single listener on main_screen would miss touches on child
+        # widgets — confirmed empirically on hardware. Registering on
+        # each widget directly is robust against the lack of EVENT_BUBBLE.
+        for _w in (self.main_screen, balance_line, self.balance_label, self.receive_qr,
+                   self.payments_container, self.payments_label,
+                   self.hero_container, self.hero_image, settings_button):
+            try:
+                _w.add_event_cb(self._on_screen_contact, lv.EVENT.PRESSED, None)
+            except Exception as _e:
+                print("Could not install contact tracker on widget: {}".format(_e))
 
         # === Welcome Screen (shown when wallet is not configured) ===
         self.welcome_container = lv.obj(self.main_screen)
@@ -918,8 +1010,49 @@ class DisplayWallet(Activity):
             tier = None
         self._set_stale_indicator(tier)
 
+    def _on_screen_contact(self, event):
+        """Record the time of any touch on the screen. Used by
+        _maybe_auto_scroll_payments_to_top to decide when to reset the
+        payments view back to the most recent transactions. In LVGL 9
+        events do NOT bubble to ancestors by default, so this callback
+        has to be registered on every interactive widget directly (see
+        the registration loop near the end of onCreate). A single
+        screen-level listener would miss touches on child widgets."""
+        try:
+            self._last_screen_contact_ms = time.ticks_ms()
+        except Exception:
+            # time.ticks_ms() can fail on some boards; treat absence as
+            # "never touched" — auto-scroll just won't fire, no crash.
+            pass
+
+    def _maybe_auto_scroll_payments_to_top(self):
+        """If the user scrolled the payments area down and then hasn't
+        touched the screen for AUTO_SCROLL_PAYMENTS_INACTIVITY_MS, scroll
+        the list back to the top so the most recent transactions are the
+        ones a passer-by sees. No-op if already at top, no-op if the
+        screen has never been touched (fresh boot, nothing to revert)."""
+        if not hasattr(self, 'payments_container'):
+            return
+        last = getattr(self, '_last_screen_contact_ms', None)
+        if last is None:
+            return
+        try:
+            elapsed = time.ticks_diff(time.ticks_ms(), last)
+        except Exception:
+            return
+        if elapsed < self.AUTO_SCROLL_PAYMENTS_INACTIVITY_MS:
+            return
+        if self.payments_container.get_scroll_y() == 0:
+            return
+        print("DisplayWallet: auto-scrolling payments back to top after {}s inactivity".format(elapsed // 1000))
+        # `True` = animated, so the user (if they happen to glance back)
+        # sees the slide rather than a hard snap. Matches the cue we use
+        # in redraw_payments_cb on new transactions.
+        self.payments_container.scroll_to_y(0, True)
+
     def _stale_timer_tick(self, timer):
         self._refresh_stale_indicator()
+        self._maybe_auto_scroll_payments_to_top()
 
     def went_online(self):
         if self.wallet and self.wallet.is_running():
@@ -1115,12 +1248,12 @@ class DisplayWallet(Activity):
     def display_balance(self, balance):
          self._last_balance = balance
          denom = self.prefs.get_string("balance_denomination", "sats")
-         Payment.use_symbol = (denom == "symbol")
+         Payment.use_symbol = (denom == "\u20bf symbol")
          self.balance_label.align(lv.ALIGN.TOP_LEFT, 2, 0)
-         if denom in ("sats", "symbol"):
+         if denom in ("sats", "\u20bf symbol"):
              sats = int(round(balance))
              formatted = NumberFormat.format_number(sats)
-             if denom == "symbol":
+             if denom == "\u20bf symbol":
                  balance_text = "\u20bf" + formatted
              else:
                  balance_text = formatted + (" sat" if sats == 1 else " sats")
@@ -1205,6 +1338,12 @@ class DisplayWallet(Activity):
         # single-threaded and cooperative, so this runs on the same event
         # loop as LVGL — direct widget writes are safe between awaits.
         self.payments_label.set_text(str(self.wallet.payment_list))
+        # Scroll the transactions area back to the top so any new tx is
+        # immediately visible — even if the user had previously scrolled
+        # down to inspect older entries. `True` = animated; gives a brief
+        # slide-up cue that the list changed. No-op when already at top.
+        if hasattr(self, 'payments_container'):
+            self.payments_container.scroll_to_y(0, True)
         # Successful payments refresh — bump last-success timestamp.
         self._note_successful_update()
 
@@ -1268,7 +1407,7 @@ class DisplayWallet(Activity):
         self.startActivity(intent)
 
     HERO_CYCLE = ["lightningpiggy", "lightningpenguin", "none"]
-    DENOMINATION_CYCLE = ["sats", "symbol", "bits", "ubtc", "mbtc", "btc"]
+    DENOMINATION_CYCLE = ["sats", "₿ symbol", "bits", "ubtc", "mbtc", "btc"]
 
     def _is_screen_locked(self):
         return self.prefs.get_string("screen_lock", "off") == "on"
