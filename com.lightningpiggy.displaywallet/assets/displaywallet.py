@@ -401,13 +401,20 @@ class DisplayWallet(Activity):
     destination = None
     receive_qr_pct_of_display = 30 # could be a setting
     # balance denomination is now stored in prefs as "balance_denomination"
-    payments_label_current_font = 2
+    # Default cycle position 1 → font_montserrat_16, matching the visible
+    # font on first launch under the old (7-entry) cycle which defaulted
+    # to position 2 → font_montserrat_16. Shifted down by one because
+    # the two lv.font_unscii_* entries were removed (they're ASCII-only
+    # and don't include the ₿ glyph U+20BF, so a transaction line like
+    # "₿1,234: comment" rendered as "1,234: comment" with a missing
+    # glyph or substituted box). Cycle now: 10 → 16 → 24 → 28 → 40.
+    payments_label_current_font = 1
     try:
-        # MicroPythonOS 0.9.3
-        payments_label_fonts = [ lv.font_montserrat_10, lv.font_unscii_8, lv.font_montserrat_16, lv.font_montserrat_24, lv.font_unscii_16, lv.font_montserrat_28, lv.font_montserrat_40]
+        # MicroPythonOS 0.9.3+
+        payments_label_fonts = [ lv.font_montserrat_10, lv.font_montserrat_16, lv.font_montserrat_24, lv.font_montserrat_28, lv.font_montserrat_40]
     except Exception as e:
         # Fallback for users with MicroPythonOS < 0.9.3
-        payments_label_fonts = [ lv.font_montserrat_10, lv.font_unscii_8, lv.font_montserrat_16, lv.font_montserrat_24, lv.font_unscii_16, lv.font_montserrat_28_compressed, lv.font_montserrat_40]
+        payments_label_fonts = [ lv.font_montserrat_10, lv.font_montserrat_16, lv.font_montserrat_24, lv.font_montserrat_28_compressed, lv.font_montserrat_40]
 
     # screens:
     main_screen = None
@@ -476,21 +483,47 @@ class DisplayWallet(Activity):
         # This line needs to be drawn first, otherwise it's over the balance label and steals all the clicks!
         balance_line = lv.line(self.main_screen)
         balance_line.set_points([{'x':2,'y':35},{'x':DisplayMetrics.pct_of_width(100-self.receive_qr_pct_of_display*1.2),'y':35}],2)
+        # Balance is split into two labels: a big number (this label) and a
+        # smaller unit suffix ("sats" / "bits" / "micro-BTC" / etc.) just
+        # to its right. Two reasons:
+        #
+        # 1. Header real-estate. With a single large font for the entire
+        #    "12,345 sats" string, longer numbers (millions of sats, or
+        #    spelled-out denominations like "milli-BTC") would push the
+        #    text into the wallet-type indicator (⚡ / chain-link icon)
+        #    or even into the QR area. Shrinking just the unit suffix
+        #    gives the number itself another ~40 px to grow into.
+        # 2. Visual hierarchy. The balance NUMBER is the headline; the
+        #    unit is metadata. Typographically that's how it should look.
+        #
+        # Width: SIZE_CONTENT so the label hugs the text width — lets
+        # the unit label position cleanly to the right via OUT_RIGHT_*.
+        # Height: explicit 45 px keeps the tap target generous (iOS/Material
+        # min ~44–48). The text renders top-left so the extra space below
+        # is invisible empty padding that's still clickable.
         self.balance_label = lv.label(self.main_screen)
         self.balance_label.set_text("")
         self.balance_label.align(lv.ALIGN.TOP_LEFT, 2, 0)
         self.balance_label.set_style_text_font(lv.font_montserrat_24, lv.PART.MAIN)
+        self.balance_label.set_size(lv.SIZE_CONTENT, 45)
         self.balance_label.add_flag(lv.obj.FLAG.CLICKABLE)
-        self.balance_label.set_width(DisplayMetrics.pct_of_width(100-self.receive_qr_pct_of_display)) # 100 - receive_qr
-        # Explicit height (45 px) extends the tap target downward to the
-        # underline at y=35 and the gap above the payments area at y=45.
-        # Without this the label height auto-fits to the text (~29 px),
-        # which is below the iOS 44 / Material 48 minimum and made the
-        # tap-to-cycle-denomination gesture finicky on hardware. The
-        # extra space is empty (text still renders top-aligned), so this
-        # only changes the click region — no visual change.
-        self.balance_label.set_height(45)
         self.balance_label.add_event_cb(self.balance_label_clicked_cb, lv.EVENT.CLICKED, None)
+        # Smaller unit suffix. Font 16 vs the number's 24 — half-size-ish.
+        # Both labels are 45 px tall and aligned via OUT_RIGHT_BOTTOM, which
+        # in LVGL means "place outside-right of ref with widget BOTTOM
+        # matching ref BOTTOM". Their text renders top-left inside the
+        # 45-tall bounding box: the big balance text fills y=0..29, the
+        # small unit text would fill y=0..19 if we did nothing. dy=10
+        # shifts the unit label down 10 px so its text occupies y=10..29
+        # — sharing a bottom edge with the balance text at y=29
+        # (approximate typographic baseline alignment).
+        self.balance_unit_label = lv.label(self.main_screen)
+        self.balance_unit_label.set_text("")
+        self.balance_unit_label.set_style_text_font(lv.font_montserrat_16, lv.PART.MAIN)
+        self.balance_unit_label.set_height(45)
+        self.balance_unit_label.align_to(self.balance_label, lv.ALIGN.OUT_RIGHT_BOTTOM, 2, 10)
+        self.balance_unit_label.add_flag(lv.obj.FLAG.CLICKABLE)
+        self.balance_unit_label.add_event_cb(self.balance_label_clicked_cb, lv.EVENT.CLICKED, None)
         self.receive_qr = lv.qrcode(self.main_screen)
         self.receive_qr.set_size(DisplayMetrics.pct_of_width(self.receive_qr_pct_of_display)) # bigger QR results in simpler code (less error correction?)
         dark, light = self._qr_colors()
@@ -606,14 +639,14 @@ class DisplayWallet(Activity):
             focusgroup.add_obj(settings_button)
 
         # Track wallet-mode widgets so they can be hidden/shown as a group
-        self.wallet_container_widgets = [balance_line, self.balance_label, self.receive_qr, self.payments_container, self.hero_container, settings_button]
+        self.wallet_container_widgets = [balance_line, self.balance_label, self.balance_unit_label, self.receive_qr, self.payments_container, self.hero_container, settings_button]
         # Install the screen-contact tracker on every interactive widget.
         # LVGL 9 doesn't bubble events to ancestors by default, so a
         # single listener on main_screen would miss touches on child
         # widgets — confirmed empirically on hardware. Registering on
         # each widget directly is robust against the lack of EVENT_BUBBLE.
-        for _w in (self.main_screen, balance_line, self.balance_label, self.receive_qr,
-                   self.payments_container, self.payments_label,
+        for _w in (self.main_screen, balance_line, self.balance_label, self.balance_unit_label,
+                   self.receive_qr, self.payments_container, self.payments_label,
                    self.hero_container, self.hero_image, settings_button):
             try:
                 _w.add_event_cb(self._on_screen_contact, lv.EVENT.PRESSED, None)
@@ -771,6 +804,7 @@ class DisplayWallet(Activity):
                 # wallet's balance and overwriting our SYMBOL.REFRESH below.
                 lv.anim_delete(self.balance_label, None)
                 self.balance_label.set_text(lv.SYMBOL.REFRESH)
+                self.balance_unit_label.set_text("")
                 self.payments_label.set_text("")
                 # Hide the QR widget until the new wallet emits a static
                 # receive code. redraw_static_receive_code_cb un-hides it
@@ -1096,6 +1130,7 @@ class DisplayWallet(Activity):
         self._reset_stale_tracking()
         if not painted_from_cache and not (hasattr(self, '_last_balance') and self._last_balance):
             self.balance_label.set_text(lv.SYMBOL.REFRESH)
+            self.balance_unit_label.set_text("")
             self.payments_label.set_text(f"\nConnecting to {wallet_type} backend.\n\nIf this takes too long, it might be down or something's wrong with the settings.")
         # by now, self.wallet can be assumed
         self.wallet.start(self.balance_updated_cb, self.redraw_payments_cb, self.redraw_static_receive_code_cb, self.error_cb)
@@ -1250,28 +1285,46 @@ class DisplayWallet(Activity):
          denom = self.prefs.get_string("balance_denomination", "sats")
          Payment.use_symbol = (denom == "\u20bf symbol")
          self.balance_label.align(lv.ALIGN.TOP_LEFT, 2, 0)
-         if denom in ("sats", "\u20bf symbol"):
+         # Split the balance into a big number + a smaller unit suffix.
+         # See onCreate for the layout reasoning. Each branch sets
+         # `number_text` (rendered in the big font) and `unit_text`
+         # (rendered in the small font, to the right). The \u20bf-symbol mode
+         # has no unit suffix since the glyph IS the unit indicator.
+         if denom == "\u20bf symbol":
              sats = int(round(balance))
-             formatted = NumberFormat.format_number(sats)
-             if denom == "\u20bf symbol":
-                 balance_text = "\u20bf" + formatted
-             else:
-                 balance_text = formatted + (" sat" if sats == 1 else " sats")
+             number_text = "\u20bf" + NumberFormat.format_number(sats)
+             unit_text = ""
+         elif denom == "sats":
+             sats = int(round(balance))
+             number_text = NumberFormat.format_number(sats)
+             unit_text = " sat" if sats == 1 else " sats"
          elif denom == "bits":
              balance_bits = round(balance / 100, 2)
-             balance_text = self.float_to_string(balance_bits, 2) + " bit"
-             if balance_bits != 1:
-                 balance_text += "s"
+             number_text = self.float_to_string(balance_bits, 2)
+             unit_text = " bit" if balance_bits == 1 else " bits"
          elif denom == "ubtc":
              balance_ubtc = round(balance / 100, 2)
-             balance_text = self.float_to_string(balance_ubtc, 2) + " micro-BTC"
+             number_text = self.float_to_string(balance_ubtc, 2)
+             unit_text = " micro-BTC"
          elif denom == "mbtc":
              balance_mbtc = round(balance / 100000, 5)
-             balance_text = self.float_to_string(balance_mbtc, 5) + " milli-BTC"
+             number_text = self.float_to_string(balance_mbtc, 5)
+             unit_text = " milli-BTC"
          elif denom == "btc":
              balance_btc = round(balance / 100000000, 8)
-             balance_text = self.float_to_string(balance_btc, 8) + " BTC"
-         self.balance_label.set_text(balance_text)
+             number_text = self.float_to_string(balance_btc, 8)
+             unit_text = " BTC"
+         else:
+             # Unknown denomination \u2014 defensive fallback that mirrors the
+             # pre-split single-string behaviour (everything in the big font).
+             number_text = str(balance)
+             unit_text = ""
+         self.balance_label.set_text(number_text)
+         self.balance_unit_label.set_text(unit_text)
+         # Re-align the unit label every time we update because the number
+         # label's content-fitted width changes with each new value \u2014 the
+         # unit needs to follow.
+         self.balance_unit_label.align_to(self.balance_label, lv.ALIGN.OUT_RIGHT_BOTTOM, 2, 10)
 
     def balance_updated_cb(self, sats_added=0):
         print(f"balance_updated_cb(sats_added={sats_added})")
@@ -1454,6 +1507,7 @@ class DisplayWallet(Activity):
 
     def main_ui_set_defaults(self):
         self.balance_label.set_text("Welcome!")
+        self.balance_unit_label.set_text("")
         self.payments_label.set_text(lv.SYMBOL.REFRESH)
 
     def qr_clicked_cb(self, event):
