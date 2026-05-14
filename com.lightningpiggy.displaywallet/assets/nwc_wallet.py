@@ -140,6 +140,13 @@ class NWCWallet(Wallet):
             await self.relay_manager.close_connections()
         except Exception as e:
             print("NWCWallet: close during reconnect failed (continuing): {}".format(e))
+        # Give the ESP32 LWIP stack time to actually release the closed
+        # sockets back to the pool before we ask for new ones. Without this
+        # pause, back-to-back close+open in a tight watchdog loop can
+        # exhaust the limited TCP socket pool and crash the wallet task.
+        # 2 s is negligible against the 6-minute reconnect cadence (threshold
+        # 3 polls × 120 s) but covers the kernel-side socket-teardown window.
+        await TaskManager.sleep(2)
         self.relay_manager = RelayManager()
         for relay in self.relays:
             self.relay_manager.add_relay(relay)
