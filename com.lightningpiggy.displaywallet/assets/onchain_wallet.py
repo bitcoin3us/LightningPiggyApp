@@ -393,20 +393,34 @@ class OnchainWallet(Wallet):
         """Single Blockbook call populates balance, payments, and receive code.
 
         Endpoint depends on mode:
-            xpub mode    → /api/v2/xpub/{xpub}?details=txs&tokens=derived
+            xpub mode    → /api/v2/xpub/{xpub}?details=txs&tokens=derived&pageSize=N
                            (server-side derivation; `tokens` carries all
                            addresses + their `transfers` count, used to
                            pick the next unused receive address)
-            address mode → /api/v2/address/{addr}?details=txs
+            address mode → /api/v2/address/{addr}?details=txs&pageSize=N
                            (single watched address; no `tokens`, no
                            receive-address rotation)
+
+        `pageSize` is capped at `self.PAYMENTS_TO_SHOW` (the user's per-slot
+        Transactions Shown setting from PR #43, default 6, max 21). Without
+        the cap, Blockbook defaults to 1000 transactions per page; on
+        addresses with many txs (e.g. mainnet genesis ~3000+, or the kind
+        of mining-payout cluster Thomas reported with ~5000) the JSON
+        response + the subsequent slot-cache write blew the ESP32-S3
+        heap with `MemoryError: memory allocation failed`. Fetching only
+        what's actually displayed kills the bug at the source.
         """
+        # PAYMENTS_TO_SHOW is set on the instance by DisplayWallet after
+        # construction (per-slot user setting). Cap defensively to 100 in
+        # case a future code path sets a larger value — at typical
+        # ~1 KB per tx that's ~100 KB of JSON, well inside the heap.
+        page_size = max(1, min(int(self.PAYMENTS_TO_SHOW or 6), 100))
         if self.mode == "xpub":
-            url = "{}/api/v2/xpub/{}?details=txs&tokens=derived".format(
-                self.blockbook_url, self.xpub)
+            url = "{}/api/v2/xpub/{}?details=txs&tokens=derived&pageSize={}".format(
+                self.blockbook_url, self.xpub, page_size)
         else:
-            url = "{}/api/v2/address/{}?details=txs".format(
-                self.blockbook_url, self.address)
+            url = "{}/api/v2/address/{}?details=txs&pageSize={}".format(
+                self.blockbook_url, self.address, page_size)
         # Don't log the full URL: in xpub mode it contains the xpub
         # (would leak the entire derivation tree if logs are ever
         # shared); in address mode it contains the watched address
