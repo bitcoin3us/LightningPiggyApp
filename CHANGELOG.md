@@ -1,6 +1,7 @@
 0.5.1
 =====
 - Optimize PNG image sizes using optipng and zopflipng
+- Fix the ESP32 BOOT button (hardware wallet-switcher) going silent after Lightning Piggy is backgrounded by another activity (a Settings or WiFi-settings round-trip, the mini-game, etc.): the GPIO watcher task could die in the background and was only ever started from onStart, which doesn't re-fire on return. The watcher now (re)starts from onResume, with a task-handle + heartbeat idempotency check so the common already-running case is a no-op and two watchers can never race
 
 0.5.0
 =====
